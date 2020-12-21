@@ -44,7 +44,7 @@ class CreditControlLine(models.Model):
         store=True,
     )
     date_sent = fields.Date(
-        string='Sent date',
+        string='Reminded date',
         readonly=True,
         states={'draft': [('readonly', False)]},
     )
@@ -52,7 +52,8 @@ class CreditControlLine(models.Model):
         selection=[
             ('draft', 'Draft'),
             ('ignored', 'Ignored'),
-            ('to_be_sent', 'Ready To Send'),
+            ('queued', 'Queued'),
+            ('to_be_sent', 'To Do'),
             ('sent', 'Done'),
             ('error', 'Error'),
             ('email_error', 'Emailing Error'),
@@ -60,6 +61,7 @@ class CreditControlLine(models.Model):
         required=True,
         readonly=True,
         default='draft',
+        track_visibility='on_change',
         help="Draft lines need to be triaged.\n"
              "Ignored lines are lines for which we do "
              "not want to send something.\n"
@@ -89,7 +91,13 @@ class CreditControlLine(models.Model):
         string='Commercial Entity',
         compute_sudo=True,
         related='partner_id.commercial_partner_id',
+        index=True,
         store=True,
+    )
+    communication_id = fields.Many2one(
+        comodel_name="credit.control.communication",
+        string="Communication process",
+        help="Credit control communication process where this line belongs",
     )
     amount_due = fields.Float(
         string='Due Amount Tax incl.',
@@ -99,11 +107,6 @@ class CreditControlLine(models.Model):
     balance_due = fields.Float(
         string='Due balance',
         required=True,
-        readonly=True,
-    )
-    mail_message_id = fields.Many2one(
-        comodel_name='mail.mail',
-        string='Sent Email',
         readonly=True,
     )
     move_line_id = fields.Many2one(
@@ -143,6 +146,7 @@ class CreditControlLine(models.Model):
     )
     level = fields.Integer(
         related='policy_level_id.level',
+        group_operator='max',
         store=True,
     )
     manually_overridden = fields.Boolean()
@@ -167,28 +171,47 @@ class CreditControlLine(models.Model):
 
     @api.model
     def _prepare_from_move_line(self, move_line, level, controlling_date,
-                                open_amount):
+                                open_amount, default_lines_vals):
         """ Create credit control line """
-        data = {
-            'date': controlling_date,
-            'date_due': move_line.date_maturity,
-            'state': 'draft',
-            'channel': level.channel,
-            'invoice_id': (move_line.invoice_id.id if
-                           move_line.invoice_id else False),
-            'partner_id': move_line.partner_id.id,
-            'amount_due': (move_line.amount_currency or move_line.debit or
-                           move_line.credit),
-            'balance_due': open_amount,
-            'policy_level_id': level.id,
-            'move_line_id': move_line.id,
-            'manual_followup': move_line.partner_id.manual_followup,
-        }
+        channel = level.channel
+        partner = move_line.partner_id
+        # Fallback to letter
+        if channel == 'email' and partner and not partner.email:
+            channel = 'letter'
+        data = default_lines_vals.copy()
+        data.update(
+            {
+                'date': controlling_date,
+                'date_due': move_line.date_maturity,
+                'state': 'draft',
+                'channel': channel,
+                'invoice_id': (
+                    move_line.invoice_id.id if move_line.invoice_id else False
+                ),
+                'partner_id': partner.id,
+                'amount_due': (
+                    move_line.amount_currency
+                    or move_line.debit
+                    or move_line.credit
+                ),
+                'balance_due': open_amount,
+                'policy_level_id': level.id,
+                'move_line_id': move_line.id,
+                'manual_followup': partner.manual_followup,
+            }
+        )
         return data
 
     @api.model
-    def create_or_update_from_mv_lines(self, lines, level, controlling_date,
-                                       check_tolerance=True):
+    def create_or_update_from_mv_lines(
+        self,
+        lines,
+        level,
+        controlling_date,
+        company,
+        check_tolerance=True,
+        default_lines_vals=None,
+    ):
         """ Create or update line based on levels
 
         if check_tolerance is true credit line will not be
@@ -201,6 +224,9 @@ class CreditControlLine(models.Model):
         :param controlling_date: date string of the credit controlling date.
                                  Generally it should be the same
                                  as create date
+        :param company: res.company
+        :param default_lines_vals: default values to create new credit control
+                                   lines with
         :param check_tolerance: boolean if True credit line
                                 will not be generated if open amount
                                 is smaller than company defined
@@ -209,15 +235,18 @@ class CreditControlLine(models.Model):
         :returns: recordset of created credit lines
         """
         currency_obj = self.env['res.currency']
-        user = self.env.user
         currencies = currency_obj.search([])
 
         tolerance = {}
-        tolerance_base = user.company_id.credit_control_tolerance
-        user_currency = user.company_id.currency_id
+        tolerance_base = company.credit_control_tolerance
+        user_currency = company.currency_id
         for currency in currencies:
-            tolerance[currency.id] = currency.compute(
-                tolerance_base, user_currency)
+            tolerance[currency.id] = currency._convert(
+                tolerance_base,
+                user_currency,
+                company,
+                controlling_date or fields.Date.today()
+            )
 
         lines_to_create = []
         lines_to_write = self.browse()
@@ -233,7 +262,12 @@ class CreditControlLine(models.Model):
             if check_tolerance and open_amount < cur_tolerance:
                 continue
             vals = self._prepare_from_move_line(
-                move_line, level, controlling_date, open_amount)
+                move_line,
+                level,
+                controlling_date,
+                open_amount,
+                default_lines_vals or {},
+            )
             lines_to_create.append(vals)
 
             # when we have lines generated earlier in draft,

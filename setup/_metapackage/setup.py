@@ -9,8 +9,10 @@ setuptools.setup(
     version=version,
     install_requires=[
         'odoo12-addon-account_credit_control',
+        'odoo12-addon-account_credit_control_queue_job',
         'odoo12-addon-account_financial_risk',
         'odoo12-addon-account_payment_return_financial_risk',
+        'odoo12-addon-partner_risk_insurance',
         'odoo12-addon-sale_financial_risk',
         'odoo12-addon-stock_financial_risk',
     ],

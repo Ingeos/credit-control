@@ -1,12 +1,14 @@
 # Copyright 2012-2017 Camptocamp SA
 # Copyright 2017 Okia SPRL (https://okia.be)
 # License AGPL-3.0 or later (http://www.gnu.org/licenses/agpl).
+from math import copysign
 from odoo import _, api, fields, models
 from odoo.exceptions import UserError, ValidationError
 
 CHANNEL_LIST = [
     ('letter', 'Letter'),
     ('email', 'Email'),
+    ('phone', 'Phone'),
 ]
 
 
@@ -43,21 +45,49 @@ class CreditControlPolicy(models.Model):
     active = fields.Boolean(
         default=True,
     )
+    policy_sign = fields.Selection(
+        selection=[
+            ('positive', 'Positive'),
+            ('negative', 'Negative'),
+        ],
+        compute='_compute_policy_sign',
+    )
+
+    @api.depends('level_ids')
+    def _compute_policy_sign(self):
+        mapping = {-1: 'negative', 0: False, 1: 'positive'}
+        for record in self:
+            policy_sign = 0
+            for level in record.level_ids:
+                if not policy_sign:
+                    policy_sign = copysign(1, level.delay_days)
+                elif copysign(1, level.delay_days) != policy_sign:
+                    policy_sign = 0
+                    break
+            record.policy_sign = mapping[policy_sign]
 
     @api.multi
-    def _move_lines_domain(self, controlling_date):
+    def _move_lines_domain(self, credit_control_run):
         """ Build the default domain for searching move lines """
         self.ensure_one()
-        return [
+        domain = [
             ('account_id', 'in', self.account_ids.ids),
-            ('date_maturity', '<=', controlling_date),
             ('reconciled', '=', False),
             ('partner_id', '!=', False),
+            ('company_id', '=', credit_control_run.company_id.id),
         ]
+        # We need to set the company in order to work properly with multi-companies.
+        # If we have Company A and Company B (child of A), we might be able to run this
+        # for company B from Company A view.
+        if self.policy_sign == "negative":
+            domain.append(('date_maturity', '>=', credit_control_run.date))
+        elif self.policy_sign == "positive":
+            domain.append(('date_maturity', '<=', credit_control_run.date))
+        return domain
 
     @api.multi
     @api.returns('account.move.line')
-    def _due_move_lines(self, controlling_date):
+    def _due_move_lines(self, credit_control_run):
         """ Get the due move lines for the policy of the company.
 
         The set of ids will be reduced and extended according
@@ -70,15 +100,14 @@ class CreditControlPolicy(models.Model):
         """
         self.ensure_one()
         move_l_obj = self.env['account.move.line']
-        user = self.env.user
-        if user.company_id.credit_policy_id.id != self.id:
+        if credit_control_run.company_id.credit_policy_id.id != self.id:
             return move_l_obj
-        domain_line = self._move_lines_domain(controlling_date)
+        domain_line = self._move_lines_domain(credit_control_run)
         return move_l_obj.search(domain_line)
 
     @api.multi
     @api.returns('account.move.line')
-    def _move_lines_subset(self, controlling_date, model, move_relation_field):
+    def _move_lines_subset(self, credit_control_run, model, move_relation_field):
         """ Get the move lines related to one model for a policy.
 
         Do not use direct SQL in order to respect security rules.
@@ -98,7 +127,7 @@ class CreditControlPolicy(models.Model):
         self.ensure_one()
         # MARK possible place for a good optimisation
         my_obj = self.env[model].with_context(active_test=False)
-        default_domain = self._move_lines_domain(controlling_date)
+        default_domain = self._move_lines_domain(credit_control_run)
 
         to_add = self.env['account.move.line']
         to_remove = self.env['account.move.line']
@@ -124,7 +153,7 @@ class CreditControlPolicy(models.Model):
 
     @api.multi
     @api.returns('account.move.line')
-    def _get_partner_related_lines(self, controlling_date):
+    def _get_partner_related_lines(self, credit_control_run):
         """ Get the move lines for a policy related to a partner.
 
         :param str controlling_date: date of credit control
@@ -132,12 +161,12 @@ class CreditControlPolicy(models.Model):
             the process
         """
         return self._move_lines_subset(
-            controlling_date, 'res.partner', 'partner_id',
+            credit_control_run, 'res.partner', 'partner_id',
         )
 
     @api.multi
     @api.returns('account.move.line')
-    def _get_invoice_related_lines(self, controlling_date):
+    def _get_invoice_related_lines(self, credit_control_run):
         """ Get the move lines for a policy related to an invoice.
 
         :param str controlling_date: date of credit control
@@ -145,12 +174,12 @@ class CreditControlPolicy(models.Model):
             the process
         """
         return self._move_lines_subset(
-            controlling_date, 'account.invoice', 'invoice_id',
+            credit_control_run, 'account.invoice', 'invoice_id',
         )
 
     @api.multi
     @api.returns('account.move.line')
-    def _get_move_lines_to_process(self, controlling_date):
+    def _get_move_lines_to_process(self, credit_control_run):
         """ Build a list of move lines ids to include in a run
         for a policy at a given date.
 
@@ -159,10 +188,10 @@ class CreditControlPolicy(models.Model):
         """
         self.ensure_one()
         # there is a priority between the lines, depicted by the calls below
-        lines = self._due_move_lines(controlling_date)
-        to_add, to_remove = self._get_partner_related_lines(controlling_date)
+        lines = self._due_move_lines(credit_control_run)
+        to_add, to_remove = self._get_partner_related_lines(credit_control_run)
         lines = (lines | to_add) - to_remove
-        to_add, to_remove = self._get_invoice_related_lines(controlling_date)
+        to_add, to_remove = self._get_invoice_related_lines(credit_control_run)
         lines = (lines | to_add) - to_remove
         return lines
 
@@ -201,6 +230,41 @@ class CreditControlPolicy(models.Model):
             )
         return True
 
+    @api.multi
+    def _generate_credit_lines(
+        self, credit_control_run, default_lines_vals=None
+    ):
+        self.ensure_one()
+        controlling_date = credit_control_run.date
+        credit_line_model = self.env['credit.control.line']
+        lines = self._get_move_lines_to_process(credit_control_run)
+        manual_lines = self._lines_different_policy(lines)
+        lines -= manual_lines
+        policy_lines_generated = credit_line_model
+        if lines:
+            # policy levels are sorted by level
+            # so iteration is in the correct order
+            create = policy_lines_generated.create_or_update_from_mv_lines
+            for level in reversed(self.level_ids):
+                level_lines = level.get_level_lines(controlling_date, lines)
+                policy_lines_generated += create(
+                    level_lines,
+                    level,
+                    controlling_date,
+                    credit_control_run.company_id,
+                    default_lines_vals=default_lines_vals,
+                )
+        if policy_lines_generated:
+            report = _(
+                "Policy \"<b>%s</b>\" has generated <b>%d Credit "
+                "Control Lines.</b><br/>"
+            ) % (self.name, len(policy_lines_generated))
+        else:
+            report = _(
+                "Policy \"<b>%s</b>\" has not generated any "
+                "Credit Control Lines.<br/>") % self.name
+        return (manual_lines, policy_lines_generated, report)
+
 
 class CreditControlPolicyLevel(models.Model):
     """Define a policy level. A level allows to determine if
@@ -218,6 +282,7 @@ class CreditControlPolicyLevel(models.Model):
         comodel_name='credit.control.policy',
         string='Related Policy',
         required=True,
+        ondelete="cascade",
     )
     level = fields.Integer(
         required=True,
@@ -244,7 +309,7 @@ class CreditControlPolicyLevel(models.Model):
         selection=CHANNEL_LIST,
         required=True,
     )
-    custom_text = fields.Text(
+    custom_text = fields.Html(
         string='Custom Message',
         required=True,
         translate=True,
@@ -254,7 +319,7 @@ class CreditControlPolicyLevel(models.Model):
         required=True,
         translate=True,
     )
-    custom_text_after_details = fields.Text(
+    custom_text_after_details = fields.Html(
         string='Custom Message after details',
         translate=True,
     )
