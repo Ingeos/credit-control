@@ -23,7 +23,7 @@
                             <field name="date_due"/>
                             <field name="channel"/>
                             <field name="date_sent"/>
-                            <field name="mail_message_id"/>
+                            <field name="communication_id"/>
                         </group>
                     </group>
                     <group>
@@ -71,16 +71,16 @@
                             string="Draft" domain="[('state', '=', 'draft')]"
                             help="Draft lines have to be triaged."/>
                     <filter name="filter_to_be_sent" icon="fa-share"
-                            string="Ready To Send"
+                            string="To Do"
                             domain="[('state', '=', 'to_be_sent')]"
-                            help="These lines are ready to send by email or by letter using the Actions."/>
+                            help="These lines are to do using the Actions."/>
                     <filter name="filter_ignored" icon="fa-times"
                             string="Ignored"
                             domain="[('state', '=', 'ignored')]"
                             help="Lines which have been ignored from previous runs."/>
                     <filter name="filter_sent" icon="fa-paper-plane"
-                            string="Sent" domain="[('state', '=', 'sent')]"
-                            help="Lines already sent."/>
+                            string="Done" domain="[('state', '=', 'sent')]"
+                            help="Lines already done."/>
                     <filter name="filter_error" icon="fa-exclamation-triangle"
                             string="Error"
                             domain="[('state', 'in', ('error', 'email_error'))]"
@@ -152,7 +152,6 @@
                 <field name="account_id"/>
                 <field name="policy_level_id"/>
                 <field name="policy_id"/>
-                <field name="mail_message_id"/>
                 <field name="activity_date_deadline"/>
                 <button name="button_schedule_activity" type="object"
                         aria-label="Schedule activity" title="Schedule activity" icon="fa-clock-o"/>
@@ -165,7 +164,7 @@
               parent="account.menu_finance"
               id="base_credit_control_menu"
               sequence="4"
-              groups="account_credit_control.group_account_credit_control_manager,account_credit_control.group_account_credit_control_user,account_credit_control.group_account_credit_control_info"/>
+              groups="account_credit_control.group_account_credit_control_info"/>
 
     <record model="ir.actions.act_window" id="credit_control_line_action">
         <field name="name">Credit Control Lines</field>
@@ -181,7 +180,7 @@
         <field name="search_view_id" ref="credit_control_line_search"/>
     </record>
 
-    <menuitem name="Credit Control Lines"
+    <menuitem name="Lines"
               parent="base_credit_control_menu"
               action="credit_control_line_action"
               sequence="20"

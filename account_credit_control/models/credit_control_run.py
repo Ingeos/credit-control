@@ -12,6 +12,7 @@ class CreditControlRun(models.Model):
     _name = "credit.control.run"
     _rec_name = 'date'
     _description = "Credit control line generator"
+    _order = "date DESC"
 
     @api.model
     def _default_policies(self):
@@ -66,12 +67,18 @@ class CreditControlRun(models.Model):
         compute='_compute_credit_control_count',
         string='# of Credit Control Lines',
     )
+    credit_control_communication_count = fields.Integer(
+        compute='_compute_credit_control_count',
+        string='# of Credit Control Communications',
+    )
     hide_change_state_button = fields.Boolean()
     company_id = fields.Many2one(
         comodel_name='res.company',
         string='Company',
         default=lambda self: self.env['res.company']._company_default_get(
             'account.account'),
+        readonly=True,
+        states={'draft': [('readonly', False)]},
         index=True,
     )
 
@@ -85,6 +92,9 @@ class CreditControlRun(models.Model):
                   for data in fetch_data}
         for rec in self:
             rec.credit_control_count = result.get(rec.id, 0)
+            rec.credit_control_communication_count = len(
+                rec.mapped("line_ids.communication_id")
+            )
 
     @api.model
     def _check_run_date(self, controlling_date):
@@ -100,17 +110,18 @@ class CreditControlRun(models.Model):
         )
         if runs:
             raise UserError(
-                _('A run has already been executed more '
-                  'recently than %s') % runs.date)
+                _('A run has already been executed more recently (%s)')
+                % (runs.date)
+            )
 
         line_obj = self.env['credit.control.line']
         lines = line_obj.search([('date', '>', controlling_date)],
                                 order='date DESC', limit=1)
         if lines:
             raise UserError(
-                _('A credit control line more '
-                  'recent than %s exists at %s') % (
-                    controlling_date, lines.date))
+                _('A credit control line more recent than %s exists at %s')
+                % (controlling_date, lines.date)
+            )
 
     @api.multi
     @api.returns('credit.control.line')
@@ -129,28 +140,14 @@ class CreditControlRun(models.Model):
         for policy in policies:
             if policy.do_nothing:
                 continue
-            lines = policy._get_move_lines_to_process(self.date)
-            manual_lines = policy._lines_different_policy(lines)
-            lines -= manual_lines
-            manually_managed_lines |= manual_lines
-            policy_lines_generated = self.env['credit.control.line']
-            if lines:
-                # policy levels are sorted by level
-                # so iteration is in the correct order
-                create = policy_lines_generated.create_or_update_from_mv_lines
-                for level in reversed(policy.level_ids):
-                    level_lines = level.get_level_lines(self.date, lines)
-                    policy_lines_generated += create(
-                        level_lines, level, self.date)
+            (
+                policy_manual_lines,
+                policy_lines_generated,
+                policy_report,
+            ) = policy._generate_credit_lines(self, {'run_id': self.id})
+            manually_managed_lines |= policy_manual_lines
             generated |= policy_lines_generated
-            if policy_lines_generated:
-                report += (_("Policy \"<b>%s</b>\" has generated <b>%d Credit "
-                             "Control Lines.</b><br/>") %
-                            (policy.name, len(policy_lines_generated)))
-            else:
-                report += _(
-                    "Policy \"<b>%s</b>\" has not generated any "
-                    "Credit Control Lines.<br/>") % policy.name
+            report += policy_report
 
         vals = {
             'state': 'done',
@@ -184,6 +181,18 @@ class CreditControlRun(models.Model):
         # Ondelete cascade don't check unlink lines restriction
         self.mapped('line_ids').unlink()
         return super().unlink()
+
+    def open_credit_communications(self):
+        """Open the generated communications."""
+        self.ensure_one()
+        action = self.env.ref(
+            'account_credit_control.credit_control_communication_action'
+        )
+        action = action.read()[0]
+        action['domain'] = [
+            ('id', 'in', self.mapped("line_ids.communication_id").ids),
+        ]
+        return action
 
     def open_credit_lines(self):
         """ Open the generated lines """
